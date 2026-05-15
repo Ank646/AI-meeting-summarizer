@@ -1,0 +1,240 @@
+version: '3.9'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Execution Intelligence Platform — Refined Architecture
+# Separate ASR / Diarization / Extraction / Graph workers
+# Redis Streams message queue between gateway and ASR workers
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-backend-base: &backend-base
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  env_file: .env
+  volumes:
+    - ./backend:/app
+    - model_cache:/root/.cache
+  networks:
+    - aiexec_net
+  restart: unless-stopped
+
+x-gpu-deploy: &gpu-deploy
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+
+  # ── FastAPI Backend (WebSocket gateway + REST API) ───────────────────────────
+  backend:
+    <<: *backend-base
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+      neo4j:    { condition: service_healthy }
+      minio:    { condition: service_started }
+    command: >
+      uvicorn main:app --host 0.0.0.0 --port 8000
+      --workers 2 --log-level info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── ASR Worker — GPU (Whisper large-v3) ─────────────────────────────────────
+  # Reads from Redis Stream aiexec:audio:{meeting_id}
+  # Separated from diarization to avoid VRAM contention
+  # Scale independently: docker compose up --scale asr-worker=N
+  asr-worker:
+    <<: *backend-base
+    depends_on: [redis, postgres]
+    command: >
+      celery -A workers.asr_worker worker
+      --loglevel=info -Q asr
+      --concurrency=1
+      --max-tasks-per-child=200
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Diarization Worker — CPU/GPU (pyannote) ───────────────────────────────
+  # Reads from Redis Stream aiexec:asr:{meeting_id}
+  # Can run on CPU to save GPU for Whisper + Ollama
+  diarization-worker:
+    <<: *backend-base
+    depends_on: [redis, postgres]
+    command: >
+      celery -A workers.diarization_worker worker
+      --loglevel=info -Q diarization
+      --concurrency=2
+      --max-tasks-per-child=200
+
+  # ── Extraction Worker — LLM + DB writes ─────────────────────────────────────
+  extraction-worker:
+    <<: *backend-base
+    depends_on: [redis, postgres, ollama]
+    command: >
+      celery -A workers.pipeline_worker worker
+      --loglevel=info -Q extraction
+      --concurrency=2
+      --max-tasks-per-child=100
+
+  # ── Graph Worker — Neo4j writes ───────────────────────────────────────────
+  graph-worker:
+    <<: *backend-base
+    depends_on: [redis, neo4j]
+    command: >
+      celery -A workers.pipeline_worker worker
+      --loglevel=info -Q graph_update
+      --concurrency=4
+      --max-tasks-per-child=500
+
+  # ── Celery Beat — scheduled jobs (Pass 2 trigger, stream cleanup) ─────────
+  celery-beat:
+    <<: *backend-base
+    depends_on: [redis]
+    command: celery -A workers.pipeline_worker beat --loglevel=info
+
+  # ── Celery Flower — worker monitoring UI ─────────────────────────────────
+  flower:
+    <<: *backend-base
+    depends_on: [redis]
+    ports:
+      - "5555:5555"
+    command: >
+      celery -A workers.pipeline_worker flower
+      --port=5555 --broker=${REDIS_URL}
+
+  # ── PostgreSQL + pgvector ───────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c effective_cache_size=2GB
+      -c max_connections=200
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      retries: 5
+    networks:
+      - aiexec_net
+
+  # ── Redis — Celery broker + pub/sub + Streams + cache ────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 4gb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+    networks:
+      - aiexec_net
+
+  # ── Neo4j Graph Database ──────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.15-community
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH:                                   ${NEO4J_USER}/${NEO4J_PASSWORD}
+      NEO4J_PLUGINS:                                '["apoc"]'
+      NEO4J_dbms_memory_heap_max__size:             2G
+      NEO4J_dbms_memory_pagecache_size:             1G
+      NEO4J_dbms_security_procedures_unrestricted:  apoc.*
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 15s
+      retries: 10
+    networks:
+      - aiexec_net
+
+  # ── MinIO Object Storage ──────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - aiexec_net
+
+  # ── Ollama LLM Server ─────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - aiexec_net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # ── Nginx — reverse proxy + Next.js static files ─────────────────────────
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend-next/out:/usr/share/nginx/html:ro
+    depends_on: [backend]
+    networks:
+      - aiexec_net
+
+networks:
+  aiexec_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  neo4j_data:
+  neo4j_logs:
+  minio_data:
+  ollama_data:
+  model_cache:
