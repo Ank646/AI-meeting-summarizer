@@ -161,6 +161,3 @@ docker compose up --scale extraction-worker=4 -d
 ```
 
 
-## License
-
-MIT
