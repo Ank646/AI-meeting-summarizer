@@ -160,7 +160,6 @@ docker compose up --scale asr-worker=2 -d
 docker compose up --scale extraction-worker=4 -d
 ```
 
-Monitor workers at [http://localhost:5555](http://localhost:5555) (Flower).
 
 ## License
 
